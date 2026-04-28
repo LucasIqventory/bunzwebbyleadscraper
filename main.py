@@ -2,11 +2,11 @@
 Bunz Webby Lead Scraper — Fully Automated Pipeline
 
 Finds massive companies in high-revenue industries with bad/no websites,
-then emails their owners automatically.
+then previews outreach by default. Use --send to send at a human-paced rate.
 
 Just run it:
-  python main.py              # Full auto — discover, analyze, find emails, send
-  python main.py --dry-run    # Same thing but don't actually send emails
+    python main.py              # Discover, analyze, find emails, preview outreach
+    python main.py --send       # Actually send, capped at 10/day by default
 """
 
 import argparse
@@ -16,7 +16,14 @@ import os
 import time
 from datetime import datetime
 
-from config import OUTPUT_DIR
+from config import (
+    EMAIL_DELAY_MAX_SECONDS,
+    EMAIL_DELAY_MIN_SECONDS,
+    ENABLE_NO_WEBSITE_PLACES,
+    MAX_EMAILS_PER_DAY,
+    OUTPUT_DIR,
+    TARGET_LOCATIONS,
+)
 from scraper import scrape_leads
 from website_analyzer import analyze_website
 from email_finder import find_emails
@@ -35,9 +42,10 @@ def save_leads_csv(leads: list[dict], filename: str = "leads.csv"):
     fieldnames = [
         "name", "domain", "industry",
         "website", "has_website",
-        "website_score", "website_grade", "website_is_bad", "website_issues",
-        "best_email", "best_name", "contact_emails",
-        "phone", "address", "search_snippet",
+        "website_score", "website_grade", "website_is_bad", "website_reachable", "website_issues",
+        "rating", "review_count", "lead_priority_score",
+        "best_email", "best_name", "contact_emails", "public_emails",
+        "phone", "address", "place_id", "google_maps_url", "source", "qualification_reason", "search_snippet",
     ]
 
     with open(filepath, "w", newline="", encoding="utf-8") as f:
@@ -59,7 +67,41 @@ def save_leads_json(leads: list[dict], filename: str = "leads.json"):
     print(f"[*] Full data saved to {filepath}")
 
 
-def run_pipeline(dry_run: bool = False, skip_pagespeed: bool = False, delay_seconds: int = 30):
+def compute_lead_priority(lead: dict) -> int:
+    """Prioritize no-website and higher-reputation leads before sending."""
+    priority = 0
+
+    if not lead.get("has_website", True):
+        priority += 100
+
+    if lead.get("website_is_bad"):
+        priority += max(0, 100 - int(lead.get("website_score") or 0))
+
+    try:
+        priority += int(float(lead.get("rating") or 0) * 10)
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        priority += min(int(lead.get("review_count") or 0), 500) // 10
+    except (TypeError, ValueError):
+        pass
+
+    return priority
+
+
+def run_pipeline(
+    dry_run: bool = True,
+    skip_pagespeed: bool = False,
+    delay_seconds: int | None = None,
+    max_emails_per_day: int = MAX_EMAILS_PER_DAY,
+    min_delay_seconds: int = EMAIL_DELAY_MIN_SECONDS,
+    max_delay_seconds: int = EMAIL_DELAY_MAX_SECONDS,
+    include_places: bool = ENABLE_NO_WEBSITE_PLACES,
+    locations: list[str] | None = None,
+    industries: list[str] | None = None,
+    places_only: bool = False,
+):
     """
     Fully automated pipeline. No arguments needed.
     Discovers → Analyzes → Finds emails → Sends.
@@ -76,7 +118,12 @@ def run_pipeline(dry_run: bool = False, skip_pagespeed: bool = False, delay_seco
     print("\n" + "─" * 40)
     print("STEP 1: Discovering companies across all industries...")
     print("─" * 40)
-    leads = scrape_leads()
+    leads = scrape_leads(
+        industries=industries,
+        include_places=include_places,
+        locations=locations,
+        include_organic=not places_only,
+    )
 
     if not leads:
         print("[!] No leads found. Check your API key or internet connection.")
@@ -111,10 +158,11 @@ def run_pipeline(dry_run: bool = False, skip_pagespeed: bool = False, delay_seco
 
     for lead in leads:
         print(f"\n  [{lead['name']}]")
-        email_data = find_emails(lead["name"], lead.get("website", ""))
+        email_data = find_emails(lead["name"], lead.get("website", ""), lead.get("address", ""))
         lead["best_email"] = email_data["best_email"]
         lead["best_name"] = email_data.get("best_name")
         lead["contact_emails"] = ", ".join(email_data.get("contact_emails", []))
+        lead["public_emails"] = ", ".join(email_data.get("public_emails", []))
         lead["owner_emails"] = email_data.get("owner_emails", [])
 
         if email_data["best_email"]:
@@ -126,9 +174,17 @@ def run_pipeline(dry_run: bool = False, skip_pagespeed: bool = False, delay_seco
         time.sleep(0.3)
 
     # ── Step 4: Filter leads worth emailing ──
-    hot_leads = [
+    for lead in leads:
+        lead["lead_priority_score"] = compute_lead_priority(lead)
+
+    hot_leads = sorted([
         l for l in leads
         if l.get("best_email") and l.get("website_is_bad")
+    ], key=compute_lead_priority, reverse=True)
+
+    no_website_reputation_leads = [
+        l for l in leads
+        if not l.get("has_website", True) and l.get("rating") and l.get("review_count")
     ]
 
     print("\n" + "─" * 40)
@@ -136,6 +192,7 @@ def run_pipeline(dry_run: bool = False, skip_pagespeed: bool = False, delay_seco
     print("─" * 40)
     print(f"  Total companies found:  {len(leads)}")
     print(f"  Bad website (< 50):     {sum(1 for l in leads if l.get('website_is_bad'))}")
+    print(f"  Rated/no website:       {len(no_website_reputation_leads)}")
     print(f"  Good website:           {sum(1 for l in leads if not l.get('website_is_bad'))}")
     print(f"  Emails found:           {sum(1 for l in leads if l.get('best_email'))}")
     print(f"  QUALIFIED LEADS:        {len(hot_leads)}")
@@ -150,13 +207,24 @@ def run_pipeline(dry_run: bool = False, skip_pagespeed: bool = False, delay_seco
         sending = not dry_run
         print("\n" + "─" * 40)
         print(f"STEP 6: {'SENDING' if sending else 'Previewing'} emails to {len(hot_leads)} qualified leads...")
+        if sending:
+            delay_description = f"fixed {delay_seconds}s" if delay_seconds is not None else f"random {min_delay_seconds}-{max_delay_seconds}s"
+            print(f"  Human pace: max {max_emails_per_day}/day, {delay_description} between sends")
         print("─" * 40)
 
-        results = send_outreach(hot_leads, dry_run=dry_run, delay_seconds=delay_seconds)
+        results = send_outreach(
+            hot_leads,
+            dry_run=dry_run,
+            delay_seconds=delay_seconds,
+            max_per_day=max_emails_per_day,
+            min_delay_seconds=min_delay_seconds,
+            max_delay_seconds=max_delay_seconds,
+        )
         log_results(results, f"email_log_{timestamp}.csv")
 
-        sent_count = sum(1 for r in results if r["sent"])
-        print(f"\n  Emails {'sent' if sending else 'previewed'}: {sent_count}/{len(results)}")
+        status_to_count = "sent" if sending else "previewed"
+        completed_count = sum(1 for r in results if r.get("status") == status_to_count)
+        print(f"\n  Emails {status_to_count}: {completed_count}/{len(results)}")
     else:
         print("\n[!] No qualified leads to email this run.")
 
@@ -167,15 +235,32 @@ def run_pipeline(dry_run: bool = False, skip_pagespeed: bool = False, delay_seco
 
 def main():
     parser = argparse.ArgumentParser(description="Bunz Webby Lead Scraper — fully automated")
-    parser.add_argument("--dry-run", action="store_true", help="Run everything but don't actually send emails")
+    parser.add_argument("--send", action="store_true", help="Actually send emails. Default is preview only.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview only. Kept for explicitness; this is the default.")
     parser.add_argument("--skip-pagespeed", action="store_true", help="Skip PageSpeed analysis (faster)")
-    parser.add_argument("--delay", type=int, default=30, help="Seconds between emails (default 30)")
+    parser.add_argument("--delay", type=int, default=None, help="Fixed seconds between live emails. Overrides min/max delay jitter.")
+    parser.add_argument("--min-delay", type=int, default=EMAIL_DELAY_MIN_SECONDS, help="Minimum random seconds between live emails")
+    parser.add_argument("--max-delay", type=int, default=EMAIL_DELAY_MAX_SECONDS, help="Maximum random seconds between live emails")
+    parser.add_argument("--daily-limit", type=int, default=MAX_EMAILS_PER_DAY, help="Maximum live emails per day")
+    parser.add_argument("--no-places", action="store_true", help="Skip Google Places no-website lead discovery")
+    parser.add_argument("--places-only", action="store_true", help="Only search Google Places for rated businesses with no website")
+    parser.add_argument("--location", action="append", dest="locations", help="Google Places location to search. Can be used multiple times.")
+    parser.add_argument("--industry", action="append", dest="industries", help="Industry query to search. Can be used multiple times.")
     args = parser.parse_args()
 
+    dry_run = not args.send or args.dry_run
+
     run_pipeline(
-        dry_run=args.dry_run,
+        dry_run=dry_run,
         skip_pagespeed=args.skip_pagespeed,
         delay_seconds=args.delay,
+        max_emails_per_day=args.daily_limit,
+        min_delay_seconds=args.min_delay,
+        max_delay_seconds=args.max_delay,
+        include_places=ENABLE_NO_WEBSITE_PLACES and not args.no_places,
+        locations=args.locations or TARGET_LOCATIONS,
+        industries=args.industries,
+        places_only=args.places_only,
     )
 
 

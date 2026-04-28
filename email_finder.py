@@ -2,14 +2,26 @@
 Email Finder — Attempts to find owner/decision-maker emails for a company.
 Uses multiple strategies:
   1. Hunter.io API (if key provided)
-  2. Common email pattern guessing from domain
-  3. Scraping contact pages for mailto: links
+    2. Scraping contact pages for mailto: links
+    3. Public web search for no-website leads
+    4. Optional common email pattern guessing from domain
 """
 
 import re
 import requests
 from urllib.parse import urlparse
-from config import HUNTER_API_KEY
+from config import GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_CX, HUNTER_API_KEY, USE_GUESSED_EMAILS
+
+
+GOOGLE_CSE_URL = "https://www.googleapis.com/customsearch/v1"
+EMAIL_PATTERN = re.compile(
+    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+)
+JUNK_EMAIL_PATTERNS = [
+    "example.com", "sentry.io", "wixpress.com", "wordpress.com",
+    "placeholder", "email.com", "domain.com", "yoursite.com",
+    ".png", ".jpg", ".gif", ".js", ".css", "noreply@",
+]
 
 
 def extract_domain(url: str) -> str:
@@ -20,6 +32,25 @@ def extract_domain(url: str) -> str:
     domain = parsed.netloc or parsed.path
     domain = domain.lower().replace("www.", "")
     return domain
+
+
+def clean_emails(emails: list[str]) -> list[str]:
+    """Normalize and remove obvious junk addresses while preserving order."""
+    cleaned = []
+    seen = set()
+    for email in emails:
+        email_lower = email.lower().strip().strip(".,;:()[]{}<>")
+        if any(junk in email_lower for junk in JUNK_EMAIL_PATTERNS):
+            continue
+        if email_lower in seen:
+            continue
+        seen.add(email_lower)
+        cleaned.append(email_lower)
+    return cleaned
+
+
+def extract_emails_from_text(text: str) -> list[str]:
+    return clean_emails(EMAIL_PATTERN.findall(text or ""))
 
 
 def hunter_domain_search(domain: str) -> list[dict]:
@@ -97,17 +128,6 @@ def scrape_contact_emails(website_url: str) -> list[str]:
         website_url.rstrip("/") + "/about-us",
     ]
 
-    email_pattern = re.compile(
-        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
-    )
-
-    # Exclude junk emails
-    junk_patterns = [
-        "example.com", "sentry.io", "wixpress.com", "wordpress.com",
-        "placeholder", "email.com", "domain.com", "yoursite.com",
-        ".png", ".jpg", ".gif", ".js", ".css",
-    ]
-
     for page_url in pages_to_check:
         try:
             resp = requests.get(page_url, timeout=10, allow_redirects=True, headers={
@@ -116,15 +136,64 @@ def scrape_contact_emails(website_url: str) -> list[str]:
             if resp.status_code != 200:
                 continue
 
-            found = email_pattern.findall(resp.text)
-            for em in found:
-                em_lower = em.lower()
-                if not any(junk in em_lower for junk in junk_patterns):
-                    emails_found.add(em_lower)
+            for email in extract_emails_from_text(resp.text):
+                emails_found.add(email)
         except Exception:
             continue
 
     return list(emails_found)
+
+
+def search_public_web_for_emails(company_name: str, address: str = "") -> list[str]:
+    """Search public web results for contact emails when the company has no website."""
+    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_CX or not company_name:
+        return []
+
+    query = f'"{company_name}" email OR contact'
+    if address:
+        query = f'{query} "{address.split(",")[0]}"'
+
+    params = {
+        "key": GOOGLE_SEARCH_API_KEY,
+        "cx": GOOGLE_SEARCH_CX,
+        "q": query,
+        "num": 5,
+    }
+
+    emails_found = []
+    try:
+        resp = requests.get(GOOGLE_CSE_URL, params=params, timeout=15)
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+    except Exception as e:
+        print(f"    [!] Public email search error: {e}")
+        return []
+
+    for item in items:
+        searchable_text = " ".join([
+            item.get("title", ""),
+            item.get("snippet", ""),
+            item.get("htmlSnippet", ""),
+        ])
+        emails_found.extend(extract_emails_from_text(searchable_text))
+
+        link = item.get("link", "")
+        if not link:
+            continue
+
+        try:
+            page_resp = requests.get(link, timeout=10, allow_redirects=True, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+            if page_resp.status_code == 200:
+                emails_found.extend(extract_emails_from_text(page_resp.text))
+        except Exception:
+            continue
+
+        if len(emails_found) >= 5:
+            break
+
+    return clean_emails(emails_found)[:5]
 
 
 def guess_owner_emails(domain: str, company_name: str) -> list[str]:
@@ -143,7 +212,7 @@ def guess_owner_emails(domain: str, company_name: str) -> list[str]:
     return patterns
 
 
-def find_emails(company_name: str, website_url: str) -> dict:
+def find_emails(company_name: str, website_url: str, address: str = "") -> dict:
     """
     Main email-finding function. Tries all strategies and returns best results.
     """
@@ -153,6 +222,7 @@ def find_emails(company_name: str, website_url: str) -> dict:
         "domain": domain,
         "owner_emails": [],       # Personal emails (best)
         "contact_emails": [],     # From website scraping
+        "public_emails": [],      # From public search results for no-website leads
         "guessed_emails": [],     # Pattern-based guesses
         "best_email": None,
         "best_name": None,
@@ -170,6 +240,9 @@ def find_emails(company_name: str, website_url: str) -> dict:
         print(f"    Scraping contact pages for {domain}...")
         scraped = scrape_contact_emails(website_url)
         result["contact_emails"] = scraped
+    else:
+        print("    Searching public web results for contact emails...")
+        result["public_emails"] = search_public_web_for_emails(company_name, address)
 
     # Strategy 3: Pattern guessing
     if domain:
@@ -191,7 +264,9 @@ def find_emails(company_name: str, website_url: str) -> dict:
             result["best_email"] = personal[0]
         else:
             result["best_email"] = result["contact_emails"][0]
-    elif result["guessed_emails"]:
+    elif result["public_emails"]:
+        result["best_email"] = result["public_emails"][0]
+    elif USE_GUESSED_EMAILS and result["guessed_emails"]:
         result["best_email"] = result["guessed_emails"][0]
 
     return result
